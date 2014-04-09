@@ -121,6 +121,7 @@ struct igt_pipe {
 	unsigned int need_set_crtc        : 1;
 	unsigned int need_set_cursor      : 1;
 	unsigned int need_wait_for_vblank : 1;
+	unsigned int has_cursor           : 1;
 #define IGT_MAX_PLANES	4
 	int n_planes;
 	igt_plane_t planes[IGT_MAX_PLANES];
@@ -143,6 +144,8 @@ struct igt_display {
 	unsigned long pipes_in_use;
 	igt_output_t *outputs;
 	igt_pipe_t pipes[I915_MAX_PIPES];
+	bool has_universal_planes;
+	bool commit_universal;
 };
 
 /* set vt into graphics mode, required to prevent fbcon from interfering */
@@ -150,6 +153,8 @@ void igt_set_vt_graphics_mode(void);
 
 void igt_display_init(igt_display_t *display, int drm_fd);
 void igt_display_fini(igt_display_t *display);
+void igt_display_use_universal_commits(igt_display_t *display,
+				       bool use_universal);
 int  igt_display_commit(igt_display_t *display);
 int  igt_display_get_n_pipes(igt_display_t *display);
 

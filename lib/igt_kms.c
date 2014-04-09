@@ -500,27 +500,24 @@ void igt_display_init(igt_display_t *display, int drm_fd)
 	 */
 	display->n_pipes = resources->count_crtcs;
 
+	drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 	plane_resources = drmModeGetPlaneResources(display->drm_fd);
 	igt_assert(plane_resources);
 
 	for (i = 0; i < display->n_pipes; i++) {
 		igt_pipe_t *pipe = &display->pipes[i];
-		igt_plane_t *plane;
-		int p, j;
+		igt_plane_t *plane = NULL;
+		int p = 0, j;
 
 		pipe->display = display;
 		pipe->pipe = i;
 
-		/* primary plane */
-		p = IGT_PLANE_PRIMARY;
-		plane = &pipe->planes[p];
-		plane->pipe = pipe;
-		plane->index = p;
-		plane->is_primary = true;
-
 		/* add the planes that can be used with that pipe */
 		for (j = 0; j < plane_resources->count_planes; j++) {
 			drmModePlane *drm_plane;
+			drmModeObjectPropertiesPtr proplist;
+			drmModePropertyPtr prop;
+			int k;
 
 			drm_plane = drmModeGetPlane(display->drm_fd,
 						    plane_resources->planes[j]);
@@ -531,21 +528,67 @@ void igt_display_init(igt_display_t *display, int drm_fd)
 				continue;
 			}
 
-			p++;
 			plane = &pipe->planes[p];
 			plane->pipe = pipe;
-			plane->index = p;
+			plane->index = p++;
 			plane->drm_plane = drm_plane;
+
+			prop = NULL;
+			proplist = drmModeObjectGetProperties(display->drm_fd,
+							      plane_resources->planes[j],
+							      DRM_MODE_OBJECT_PLANE);
+			for (k = 0; k < proplist->count_props; k++) {
+				prop = drmModeGetProperty(display->drm_fd, proplist->props[k]);
+				if (!prop)
+					continue;
+
+				if (strcmp(prop->name, "type") != 0) {
+					drmModeFreeProperty(prop);
+					continue;
+				}
+
+				switch (proplist->prop_values[k]) {
+				case DRM_PLANE_TYPE_PRIMARY:
+					plane->is_primary = 1;
+					display->has_universal_planes = 1;
+					break;
+				case DRM_PLANE_TYPE_CURSOR:
+					plane->is_cursor = 1;
+					pipe->has_cursor = 1;
+					display->has_universal_planes = 1;
+					break;
+				}
+
+				drmModeFreeProperty(prop);
+				break;
+			}
+
 		}
 
-		/* cursor plane */
-		p++;
-		plane = &pipe->planes[p];
-		plane->pipe = pipe;
-		plane->index = p;
-		plane->is_cursor = true;
+		/*
+		 * Add a drm_plane-less primary plane for kernels without
+		 * universal plane support.
+		 */
+		if (!display->has_universal_planes) {
+			plane = &pipe->planes[p];
+			plane->pipe = pipe;
+			plane->index = p++;
+			plane->is_primary = true;
+		}
 
-		pipe->n_planes = ++p;
+		/*
+		 * Add drm_plane-less cursor plane for kernels that don't
+		 * expose a universal cursor plane.
+		 */
+		if (!pipe->has_cursor) {
+			/* cursor plane */
+			plane = &pipe->planes[p];
+			plane->pipe = pipe;
+			plane->index = p++;
+			plane->is_cursor = true;
+		}
+
+		pipe->n_planes = p;
 
 		/* make sure we don't overflow the plane array */
 		igt_assert(pipe->n_planes <= IGT_MAX_PLANES);
@@ -700,16 +743,29 @@ static igt_plane_t *igt_pipe_get_plane(igt_pipe_t *pipe, enum igt_plane plane)
 {
 	int idx;
 
-	/* Cursor plane is always the upper plane */
-	if (plane == IGT_PLANE_CURSOR)
-		idx = pipe->n_planes - 1;
-	else {
-		igt_assert_f(plane >= 0 && plane < (pipe->n_planes),
-			     "plane=%d\n", plane);
-		idx = plane;
+	for (idx = 0; idx < pipe->n_planes; idx++) {
+		switch (plane) {
+		case IGT_PLANE_PRIMARY:
+			if (pipe->planes[idx].is_primary)
+				return &pipe->planes[idx];
+			break;
+		case IGT_PLANE_CURSOR:
+			if (pipe->planes[idx].is_cursor)
+				return &pipe->planes[idx];
+			break;
+		case IGT_PLANE_2:
+			if (!pipe->planes[idx].is_primary &&
+			    !pipe->planes[idx].is_cursor)
+				return &pipe->planes[idx];
+		default:
+			if (!pipe->planes[idx].is_primary &&
+			    !pipe->planes[idx].is_cursor)
+				/* Consume this overlay and keep searching for another */
+				plane--;
+		}
 	}
 
-	return &pipe->planes[idx];
+	return NULL;
 }
 
 static uint32_t igt_plane_get_fb_id(igt_plane_t *plane)
@@ -760,6 +816,8 @@ static int igt_drm_plane_commit(igt_plane_t *plane, igt_output_t *output)
 	igt_pipe_t *pipe;
 	uint32_t fb_id, crtc_id;
 	int ret;
+
+	igt_assert(plane->drm_plane);
 
 	fb_id = igt_plane_get_fb_id(plane);
 	crtc_id = output->config.crtc->crtc_id;
@@ -820,7 +878,11 @@ static int igt_drm_plane_commit(igt_plane_t *plane, igt_output_t *output)
 
 static int igt_plane_commit(igt_plane_t *plane, igt_output_t *output)
 {
-	if (plane->is_cursor) {
+	struct igt_display *display = plane->pipe->display;
+
+	if (display->commit_universal && plane->drm_plane) {
+		igt_drm_plane_commit(plane, output);
+	} else if (plane->is_cursor) {
 		igt_cursor_commit(plane, output);
 	} else if (plane->is_primary) {
 		/* state updated by SetCrtc */
@@ -838,8 +900,8 @@ static int igt_output_commit(igt_output_t *output)
 	int i;
 
 	pipe = igt_output_get_driving_pipe(output);
-	if (pipe->need_set_crtc) {
-		igt_plane_t *primary = &pipe->planes[0];
+	if (pipe->need_set_crtc && !display->commit_universal) {
+		igt_plane_t *primary = igt_pipe_get_plane(pipe, IGT_PLANE_PRIMARY);
 		drmModeModeInfo *mode;
 		uint32_t fb_id, crtc_id;
 		int ret;
@@ -889,7 +951,7 @@ static int igt_output_commit(igt_output_t *output)
 		primary->fb_changed = false;
 	}
 
-	if (pipe->need_set_cursor) {
+	if (pipe->need_set_cursor && !display->commit_universal) {
 		igt_plane_t *cursor;
 		uint32_t gem_handle, crtc_id;
 		int ret;
@@ -938,6 +1000,16 @@ static int igt_output_commit(igt_output_t *output)
 	}
 
 	return 0;
+}
+
+/*
+ * Indicate whether future display commits should use universal plane API's
+ * or legacy API's.
+ */
+void igt_display_use_universal_commits(igt_display_t *display,
+				       bool use_universal)
+{
+	display->commit_universal = use_universal;
 }
 
 int igt_display_commit(igt_display_t *display)
