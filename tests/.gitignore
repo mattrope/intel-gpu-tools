@@ -121,6 +121,7 @@ kms_pipe_crc_basic
 kms_plane
 kms_render
 kms_setmode
+kms_universal_plane
 multi-tests.txt
 pm_lpsp
 pm_pc8
