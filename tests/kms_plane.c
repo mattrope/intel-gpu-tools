@@ -94,7 +94,7 @@ test_position_init(test_position_t *test, igt_output_t *output, enum pipe pipe)
 	test->pipe_crc = igt_pipe_crc_new(pipe, INTEL_PIPE_CRC_SOURCE_AUTO);
 
 	igt_output_set_pipe(output, pipe);
-	primary = igt_output_get_plane(output, 0);
+	primary = igt_output_get_plane(output, IGT_PLANE_PRIMARY);
 
 	mode = igt_output_get_mode(output);
 	igt_create_color_fb(data->drm_fd, mode->hdisplay, mode->vdisplay,
@@ -146,8 +146,13 @@ test_plane_position_with_output(data_t *data,
 	test_position_init(&test, output, pipe);
 
 	mode = igt_output_get_mode(output);
-	primary = igt_output_get_plane(output, 0);
+	primary = igt_output_get_plane(output, IGT_PLANE_PRIMARY);
 	sprite = igt_output_get_plane(output, plane);
+
+	if (sprite->is_primary) {
+		test_position_fini(&test, output);
+		igt_skip("Skipping primary plane\n");
+	}
 
 	create_fb_for_mode__position(data, mode, 100, 100, 64, 64,
 				     &primary_fb);
@@ -213,7 +218,7 @@ run_tests_for_pipe(data_t *data, enum pipe pipe)
 {
 	int plane;
 
-	for (plane = 1; plane < IGT_MAX_PLANES; plane++)
+	for (plane = 0; plane < IGT_MAX_PLANES; plane++)
 		run_tests_for_pipe_plane(data, pipe, plane);
 }
 
