@@ -810,7 +810,11 @@ static int igt_cursor_commit(igt_plane_t *plane, igt_output_t *output)
 	return 0;
 }
 
-static int igt_drm_plane_commit(igt_plane_t *plane, igt_output_t *output)
+/*
+ * Attempt to commit a plane; if the DRM call to program the plane fails,
+ * just return an error code (but don't fail the current subtest).
+ */
+int igt_drm_plane_try_commit(igt_plane_t *plane, igt_output_t *output)
 {
 	igt_display_t *display = output->display;
 	igt_pipe_t *pipe;
@@ -842,7 +846,8 @@ static int igt_drm_plane_commit(igt_plane_t *plane, igt_output_t *output)
 				      IGT_FIXED(0,0), /* src_w */
 				      IGT_FIXED(0,0) /* src_h */);
 
-		igt_assert(ret == 0);
+		if (ret)
+			return ret;
 
 		plane->fb_changed = false;
 	} else if (plane->fb_changed || plane->position_changed) {
@@ -866,12 +871,22 @@ static int igt_drm_plane_commit(igt_plane_t *plane, igt_output_t *output)
 				      IGT_FIXED(plane->fb->width,0), /* src_w */
 				      IGT_FIXED(plane->fb->height,0) /* src_h */);
 
-		igt_assert(ret == 0);
+		if (ret)
+			return ret;
 
 		plane->fb_changed = false;
 		plane->position_changed = false;
 		pipe->need_wait_for_vblank = true;
 	}
+
+	return 0;
+}
+
+static int igt_drm_plane_commit(igt_plane_t *plane, igt_output_t *output)
+{
+	int ret = igt_drm_plane_try_commit(plane, output);
+
+	igt_assert(ret == 0);
 
 	return 0;
 }

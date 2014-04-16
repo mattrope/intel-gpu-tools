@@ -157,6 +157,7 @@ void igt_display_use_universal_commits(igt_display_t *display,
 				       bool use_universal);
 int  igt_display_commit(igt_display_t *display);
 int  igt_display_get_n_pipes(igt_display_t *display);
+int  igt_drm_plane_try_commit(igt_plane_t *plane, igt_output_t *output);
 
 const char *igt_output_name(igt_output_t *output);
 drmModeModeInfo *igt_output_get_mode(igt_output_t *output);
