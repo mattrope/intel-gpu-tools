@@ -1551,6 +1551,7 @@ static int do_display_commit(igt_display_t *display,
 
 	LOG_INDENT(display, "commit");
 
+	igt_debug_wait_for_keypress("commit");
 	igt_display_refresh(display);
 
 	for (i = 0; i < display->n_outputs; i++) {
