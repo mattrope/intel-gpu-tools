@@ -154,7 +154,8 @@ void kmstest_unset_all_crtcs(int drm_fd, drmModeResPtr resources);
 enum igt_commit_style {
 	COMMIT_LEGACY = 0,
 	COMMIT_UNIVERSAL,
-	/* We'll add atomic here eventually. */
+	COMMIT_NUCLEAR,   /* atomic plane operations on single crtc only */
+	/* We'll add full atomic here eventually. */
 };
 
 typedef struct igt_display igt_display_t;
@@ -189,6 +190,16 @@ typedef struct {
 	struct igt_fb *fb;
 
 	uint32_t rotation_property;
+	uint32_t fb_property;
+	uint32_t crtc_property;
+	uint32_t dstx_property;
+	uint32_t dsty_property;
+	uint32_t dstw_property;
+	uint32_t dsth_property;
+	uint32_t srcx_property;
+	uint32_t srcy_property;
+	uint32_t srcw_property;
+	uint32_t srch_property;
 
 	/* position within pipe_src_w x pipe_src_h */
 	int crtc_x, crtc_y;
@@ -216,6 +227,11 @@ typedef struct {
 	char *name;
 	bool valid;
 	unsigned long pending_crtc_idx_mask;
+
+#ifdef HAVE_ATOMIC
+	/* Property set for nuclear pageflip */
+	drmModePropertySetPtr set;
+#endif
 } igt_output_t;
 
 struct igt_display {
@@ -227,6 +243,7 @@ struct igt_display {
 	igt_output_t *outputs;
 	igt_pipe_t pipes[I915_MAX_PIPES];
 	bool has_universal_planes;
+	bool has_atomic_props;
 };
 
 void igt_display_init(igt_display_t *display, int drm_fd);

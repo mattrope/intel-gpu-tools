@@ -50,13 +50,15 @@
 #include "igt_debugfs.h"
 
 /*
- * There hasn't been a release of libdrm containing these #define's yet, so
- * copy them here to allow compilation to succeed in the mean time.
+ * Universal plane bits didn't show up until libdrm 2.4.55 and atomic hasn't
+ * landed in a release yet, so copy the relevant #define's here to allow
+ * compilation to succeeed on older libdrm's.
  *
  * We can drop these #define's and just make i-g-t depend on the proper libdrm
  * version in the future.
  */
 #define DRM_CLIENT_CAP_UNIVERSAL_PLANES 2
+#define DRM_CLIENT_CAP_ATOMIC 3
 #define DRM_PLANE_TYPE_OVERLAY 0
 #define DRM_PLANE_TYPE_PRIMARY 1
 #define DRM_PLANE_TYPE_CURSOR  2
@@ -944,6 +946,42 @@ static int get_drm_plane_type(int drm_fd, uint32_t plane_id)
 	return DRM_PLANE_TYPE_OVERLAY;
 }
 
+/*
+ * Lookup all of the properties we use for a plane.
+ */
+static void lookup_plane_properties(int drm_fd,
+				    igt_plane_t *plane)
+{
+	uint64_t prop_value;
+
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "rotation",
+			   &plane->rotation_property, &prop_value, NULL);
+	plane->rotation = (igt_rotation_t)prop_value;
+
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "FB_ID",
+			   &plane->fb_property, NULL, NULL);
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "CRTC_ID",
+			   &plane->crtc_property, NULL, NULL);
+
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "CRTC_X",
+			   &plane->dstx_property, NULL, NULL);
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "CRTC_Y",
+			   &plane->dsty_property, NULL, NULL);
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "CRTC_W",
+			   &plane->dstw_property, NULL, NULL);
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "CRTC_H",
+			   &plane->dsth_property, NULL, NULL);
+
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "SRC_X",
+			   &plane->srcx_property, NULL, NULL);
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "SRC_Y",
+			   &plane->srcy_property, NULL, NULL);
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "SRC_W",
+			   &plane->srcw_property, NULL, NULL);
+	get_plane_property(drm_fd, plane->drm_plane->plane_id, "SRC_H",
+			   &plane->srch_property, NULL, NULL);
+}
+
 void igt_display_init(igt_display_t *display, int drm_fd)
 {
 	drmModeRes *resources;
@@ -966,6 +1004,7 @@ void igt_display_init(igt_display_t *display, int drm_fd)
 	display->n_pipes = resources->count_crtcs;
 
 	drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+	drmSetClientCap(drm_fd, DRM_CLIENT_CAP_ATOMIC, 1);
 	plane_resources = drmModeGetPlaneResources(display->drm_fd);
 	igt_assert(plane_resources);
 
@@ -981,7 +1020,6 @@ void igt_display_init(igt_display_t *display, int drm_fd)
 		/* add the planes that can be used with that pipe */
 		for (j = 0; j < plane_resources->count_planes; j++) {
 			drmModePlane *drm_plane;
-			uint64_t prop_value;
 
 			drm_plane = drmModeGetPlane(display->drm_fd,
 						    plane_resources->planes[j]);
@@ -1023,12 +1061,21 @@ void igt_display_init(igt_display_t *display, int drm_fd)
 			plane->pipe = pipe;
 			plane->drm_plane = drm_plane;
 
-			get_plane_property(display->drm_fd, drm_plane->plane_id,
-					   "rotation",
-					   &plane->rotation_property,
-					   &prop_value,
-					   NULL);
-			plane->rotation = (igt_rotation_t)prop_value;
+			lookup_plane_properties(display->drm_fd, plane);
+#ifdef HAVE_ATOMIC
+			display->has_atomic_props =
+				(plane->fb_property &&
+				 plane->crtc_property &&
+				 plane->rotation_property &&
+				 plane->dstx_property &&
+				 plane->dsty_property &&
+				 plane->dstw_property &&
+				 plane->dsth_property &&
+				 plane->srcx_property &&
+				 plane->srcy_property &&
+				 plane->srcw_property &&
+				 plane->srch_property);
+#endif
 		}
 
 		if (display->has_universal_planes) {
@@ -1336,6 +1383,79 @@ static int igt_drm_plane_commit(igt_plane_t *plane,
 	return 0;
 }
 
+#ifdef HAVE_ATOMIC
+/*
+ * Apply plane changes for an atomic operation.  Note that we don't actually
+ * perform the commit here; we just push the proper values into the atomic
+ * property set and let either igt_output_commit (nuclear) or
+ * igt_display_commit (atomic) issue the actual commit.
+ */
+static int igt_drm_plane_commit_atomic(igt_plane_t *plane,
+				       igt_output_t *output,
+				       drmModePropertySetPtr set,
+				       bool fail_on_error)
+{
+	uint32_t fb_id, crtc_id, plane_id;
+
+	igt_assert(set);
+	igt_assert(plane->drm_plane);
+
+	/* it's an error to try an unsupported feature */
+	igt_assert(igt_plane_supports_rotation(plane) ||
+		   !plane->rotation_changed);
+
+	fb_id = igt_plane_get_fb_id(plane);
+	crtc_id = fb_id ? output->config.crtc->crtc_id : 0;
+	plane_id = plane->drm_plane->plane_id;
+
+	if (plane->fb_changed) {
+		drmModePropertySetAdd(set, plane_id, plane->fb_property,
+				      fb_id);
+		drmModePropertySetAdd(set, plane_id,
+				      plane->crtc_property, crtc_id);
+	}
+
+	if (plane->fb &&
+	    (plane->fb_changed || plane->position_changed || plane->panning_changed)) {
+		/* Source coordinates */
+		drmModePropertySetAdd(set, plane_id,
+				      plane->srcx_property,
+				      IGT_FIXED(plane->pan_x,0));
+		drmModePropertySetAdd(set, plane_id,
+				      plane->srcy_property,
+				      IGT_FIXED(plane->pan_y,0));
+		drmModePropertySetAdd(set, plane_id,
+				      plane->srcw_property,
+				      IGT_FIXED(plane->fb->width - plane->pan_x,0));
+		drmModePropertySetAdd(set, plane_id,
+				      plane->srch_property,
+				      IGT_FIXED(plane->fb->height - plane->pan_y,0));
+
+		/* Destination coordinates */
+		drmModePropertySetAdd(set, plane_id, plane->dstx_property,
+				      plane->crtc_x);
+		drmModePropertySetAdd(set, plane_id, plane->dsty_property,
+				      plane->crtc_y);
+		drmModePropertySetAdd(set, plane_id, plane->dstw_property,
+				      plane->crtc_w);
+		drmModePropertySetAdd(set, plane_id, plane->dsth_property,
+				      plane->crtc_h);
+	}
+
+	if (plane->rotation_changed)
+		drmModePropertySetAdd(set, plane_id, plane->rotation_property,
+				      plane->rotation);
+
+
+	plane->fb_changed = false;
+	plane->position_changed = false;
+	plane->panning_changed = false;
+	plane->rotation = false;
+
+	return 0;
+}
+#endif
+
 /*
  * Commit position and fb changes to a cursor via legacy ioctl's.  If commit
  * fails, we'll either fail immediately (for tests that expect the commit to
@@ -1486,6 +1606,11 @@ static int igt_plane_commit(igt_plane_t *plane,
 	} else if (plane->is_primary && s == COMMIT_LEGACY) {
 		return igt_primary_plane_commit_legacy(plane, output,
 						       fail_on_error);
+#ifdef HAVE_ATOMIC
+	} else if (s == COMMIT_NUCLEAR) {
+		return igt_drm_plane_commit_atomic(plane, output, output->set,
+						   fail_on_error);
+#endif
 	} else {
 		return igt_drm_plane_commit(plane, output, fail_on_error);
 	}
@@ -1513,6 +1638,13 @@ static int igt_output_commit(igt_output_t *output,
 
 	pipe = igt_output_get_driving_pipe(output);
 
+#ifdef HAVE_ATOMIC
+	if (s == COMMIT_NUCLEAR) {
+		output->set = drmModePropertySetAlloc();
+		igt_assert(output->set);
+	}
+#endif
+
 	for (i = 0; i < pipe->n_planes; i++) {
 		igt_plane_t *plane = &pipe->planes[i];
 
@@ -1522,6 +1654,17 @@ static int igt_output_commit(igt_output_t *output,
 		ret = igt_plane_commit(plane, output, s, fail_on_error);
 		CHECK_RETURN(ret, fail_on_error);
 	}
+
+#ifdef HAVE_ATOMIC
+	/* Nuclear pageflip commit */
+	if (s == COMMIT_NUCLEAR) {
+		ret = drmModePropertySetCommit(display->drm_fd, 0, NULL,
+					       output->set);
+		drmModePropertySetFree(output->set);
+		output->set = NULL;
+		CHECK_RETURN(ret, fail_on_error);
+	}
+#endif
 
 	/*
 	 * If the crtc is enabled, wait until the next vblank before returning
@@ -1550,6 +1693,14 @@ static int do_display_commit(igt_display_t *display,
 	int i, ret;
 
 	LOG_INDENT(display, "commit");
+
+#ifndef HAVE_ATOMIC
+	/*
+	 * If our libdrm doesn't support atomic; skip any tests that explicitly
+	 * ask for nuclear pageflip or atomic modeset.
+	 */
+	igt_skip_on(s == COMMIT_NUCLEAR);
+#endif
 
 	igt_debug_wait_for_keypress("commit");
 	igt_display_refresh(display);
