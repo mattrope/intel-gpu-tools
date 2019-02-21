@@ -25,164 +25,153 @@
 #include "igt.h"
 #include <math.h>
 
-
 IGT_TEST_DESCRIPTION("Test crtc background color feature");
 
+/*
+ * Paints a desired color into a full-screen primary plane and then compares
+ * that CRC with turning off all planes and setting the CRTC background to the
+ * same color.
+ *
+ * At least on current Intel platforms, the CRC tests appear to always fail,
+ * even though the resulting pipe output seems to be the same.  The bspec tells
+ * us that we must have at least one plane turned on when taking a pipe-level
+ * CRC, so the fact that we're violating that may explain the failures.  If
+ * your platform gives failures for all tests, you may want to run with
+ * --interactive-debug=bgcolor --skip-crc-compare to visually inspect that the
+ * background color matches the equivalent solid plane.
+ */
+
 typedef struct {
-	int gfx_fd;
 	igt_display_t display;
-	struct igt_fb fb;
-	igt_crc_t ref_crc;
+	int gfx_fd;
+	igt_output_t *output;
 	igt_pipe_crc_t *pipe_crc;
+	drmModeModeInfo *mode;
 } data_t;
 
-#define BLACK      0x000000           /* BGR 8bpc */
-#define CYAN       0xFFFF00           /* BGR 8bpc */
-#define PURPLE     0xFF00FF           /* BGR 8bpc */
-#define WHITE      0xFFFFFF           /* BGR 8bpc */
-
-#define BLACK64    0x000000000000     /* BGR 16bpc */
-#define CYAN64     0xFFFFFFFF0000     /* BGR 16bpc */
-#define PURPLE64   0xFFFF0000FFFF     /* BGR 16bpc */
-#define YELLOW64   0x0000FFFFFFFF     /* BGR 16bpc */
-#define WHITE64    0xFFFFFFFFFFFF     /* BGR 16bpc */
-#define RED64      0x00000000FFFF     /* BGR 16bpc */
-#define GREEN64    0x0000FFFF0000     /* BGR 16bpc */
-#define BLUE64     0xFFFF00000000     /* BGR 16bpc */
-
-static void
-paint_background(data_t *data, struct igt_fb *fb, drmModeModeInfo *mode,
-		uint32_t background, double alpha)
+/*
+ * Local copy of kernel uapi
+ */
+static inline __u64
+local_argb(__u8 bpc, __u16 alpha, __u16 red, __u16 green, __u16 blue)
 {
-	cairo_t *cr;
-	int w, h;
-	double r, g, b;
+       int msb_shift = 16 - bpc;
 
-	w = mode->hdisplay;
-	h = mode->vdisplay;
-
-	cr = igt_get_cairo_ctx(data->gfx_fd, &data->fb);
-
-	/* Paint with background color */
-	r = (double) (background & 0xFF) / 255.0;
-	g = (double) ((background & 0xFF00) >> 8) / 255.0;
-	b = (double) ((background & 0xFF0000) >> 16) / 255.0;
-	igt_paint_color_alpha(cr, 0, 0, w, h, r, g, b, alpha);
-
-	igt_put_cairo_ctx(data->gfx_fd, &data->fb, cr);
+       return (__u64)alpha << msb_shift << 48 |
+              (__u64)red   << msb_shift << 32 |
+              (__u64)green << msb_shift << 16 |
+              (__u64)blue  << msb_shift;
 }
 
-static void prepare_crtc(data_t *data, igt_output_t *output, enum pipe pipe,
-			igt_plane_t *plane, int opaque_buffer, int plane_color,
-			uint64_t pipe_background_color)
+static void test_background(data_t *data, enum pipe pipe, int w, int h,
+			    __u64 r, __u64 g, __u64 b)
 {
-	drmModeModeInfo *mode;
-	igt_display_t *display = &data->display;
-	int fb_id;
-	double alpha;
+	igt_crc_t plane_crc, bg_crc;
+	struct igt_fb colorfb;
+	igt_plane_t *plane = igt_output_get_plane_type(data->output,
+						       DRM_PLANE_TYPE_PRIMARY);
 
-	igt_output_set_pipe(output, pipe);
 
-	/* create the pipe_crc object for this pipe */
-	igt_pipe_crc_free(data->pipe_crc);
-	data->pipe_crc = igt_pipe_crc_new(data->gfx_fd, pipe, INTEL_PIPE_CRC_SOURCE_AUTO);
+	/* Fill the primary plane and set the background to the same color */
+	igt_create_color_fb(data->gfx_fd, w, h, DRM_FORMAT_XRGB2101010,
+			    LOCAL_DRM_FORMAT_MOD_NONE,
+			    (double)r / 0xFFFF,
+			    (double)g / 0xFFFF,
+			    (double)b / 0xFFFF,
+			    &colorfb);
+	igt_plane_set_fb(plane, &colorfb);
+	igt_pipe_set_prop_value(&data->display, pipe, IGT_CRTC_BACKGROUND,
+				local_argb(16, 0xffff, r, g, b));
+	igt_display_commit2(&data->display, COMMIT_ATOMIC);
+	igt_pipe_crc_collect_crc(data->pipe_crc, &plane_crc);
+	igt_debug_wait_for_keypress("bgcolor");
 
-	mode = igt_output_get_mode(output);
-
-	fb_id = igt_create_fb(data->gfx_fd,
-			mode->hdisplay, mode->vdisplay,
-			DRM_FORMAT_XRGB8888,
-			LOCAL_DRM_FORMAT_MOD_NONE, /* tiled */
-			&data->fb);
-	igt_assert(fb_id);
-
-	/* To make FB pixel win with background color, set alpha as full opaque */
-	igt_pipe_set_prop_value(display, pipe, IGT_CRTC_BACKGROUND, pipe_background_color);
-	if (opaque_buffer)
-		alpha = 1.0;    /* alpha 1 is fully opque */
-	else
-		alpha = 0.0;    /* alpha 0 is fully transparent */
-	paint_background(data, &data->fb, mode, plane_color, alpha);
-
-	igt_plane_set_fb(plane, &data->fb);
-	igt_display_commit2(display, COMMIT_UNIVERSAL);
-}
-
-static void cleanup_crtc(data_t *data, igt_output_t *output, igt_plane_t *plane)
-{
-	igt_display_t *display = &data->display;
-
-	igt_pipe_crc_free(data->pipe_crc);
-	data->pipe_crc = NULL;
-
-	igt_remove_fb(data->gfx_fd, &data->fb);
-
-	igt_pipe_obj_set_prop_value(plane->pipe, IGT_CRTC_BACKGROUND, BLACK64);
+	/* Turn off the primary plane so only bg shows */
 	igt_plane_set_fb(plane, NULL);
-	igt_output_set_pipe(output, PIPE_ANY);
+	igt_display_commit2(&data->display, COMMIT_ATOMIC);
+	igt_pipe_crc_collect_crc(data->pipe_crc, &bg_crc);
+	igt_debug_wait_for_keypress("bgcolor");
 
-	igt_display_commit2(display, COMMIT_UNIVERSAL);
+	/*
+	 * The following test relies on hardware that generates valid CRCs
+	 * even when no planes are on.  Sadly, this doesn't appear to be the
+	 * case for current Intel platforms; pipe CRC's never match bgcolor
+	 * CRC's, likely because we're violating the bspec's guidance that there
+	 * must always be at least one real plane turned on when taking the
+	 * pipe-level ("dmux") CRC.
+	 */
+	igt_assert_crc_equal(&plane_crc, &bg_crc);
 }
 
-static void test_crtc_background(data_t *data)
-{
-	igt_display_t *display = &data->display;
-	igt_output_t *output;
-	enum pipe pipe;
-	int valid_tests = 0;
-
-	for_each_pipe_with_valid_output(display, pipe, output) {
-		igt_plane_t *plane;
-
-		igt_output_set_pipe(output, pipe);
-
-		plane = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
-		igt_require(igt_pipe_has_prop(display, pipe, IGT_CRTC_BACKGROUND));
-
-		prepare_crtc(data, output, pipe, plane, 1, PURPLE, BLACK64);
-
-		/* Now set background without using a plane, i.e.,
-		 * Disable the plane to let hw background color win blend. */
-		igt_plane_set_fb(plane, NULL);
-		igt_pipe_set_prop_value(display, pipe, IGT_CRTC_BACKGROUND, PURPLE64);
-		igt_display_commit2(display, COMMIT_UNIVERSAL);
-
-		/* Try few other background colors */
-		igt_pipe_set_prop_value(display, pipe, IGT_CRTC_BACKGROUND, CYAN64);
-		igt_display_commit2(display, COMMIT_UNIVERSAL);
-
-		igt_pipe_set_prop_value(display, pipe, IGT_CRTC_BACKGROUND, YELLOW64);
-		igt_display_commit2(display, COMMIT_UNIVERSAL);
-
-		igt_pipe_set_prop_value(display, pipe, IGT_CRTC_BACKGROUND, RED64);
-		igt_display_commit2(display, COMMIT_UNIVERSAL);
-
-		igt_pipe_set_prop_value(display, pipe, IGT_CRTC_BACKGROUND, GREEN64);
-		igt_display_commit2(display, COMMIT_UNIVERSAL);
-
-		igt_pipe_set_prop_value(display, pipe, IGT_CRTC_BACKGROUND, BLUE64);
-		igt_display_commit2(display, COMMIT_UNIVERSAL);
-
-		igt_pipe_set_prop_value(display, pipe, IGT_CRTC_BACKGROUND, WHITE64);
-		igt_display_commit2(display, COMMIT_UNIVERSAL);
-
-		valid_tests++;
-		cleanup_crtc(data, output, plane);
-	}
-	igt_require_f(valid_tests, "no valid crtc/connector combinations found\n");
-}
-
-igt_simple_main
+igt_main
 {
 	data_t data = {};
+	igt_output_t *output;
+	drmModeModeInfo *mode;
+	int w, h;
+	enum pipe pipe;
 
-	igt_skip_on_simulation();
+	igt_fixture {
+		data.gfx_fd = drm_open_driver_master(DRIVER_ANY);
+		kmstest_set_vt_graphics_mode();
 
-	data.gfx_fd = drm_open_driver(DRIVER_INTEL);
-	igt_require_pipe_crc(data.gfx_fd);
-	igt_display_require(&data.display, data.gfx_fd);
+		igt_require_pipe_crc(data.gfx_fd);
+		igt_display_require(&data.display, data.gfx_fd);
+	}
 
-	test_crtc_background(&data);
+	for_each_pipe_static(pipe) igt_subtest_group {
+		igt_fixture {
+			igt_display_require_output_on_pipe(&data.display, pipe);
+			igt_require(igt_pipe_has_prop(&data.display, pipe,
+						      IGT_CRTC_BACKGROUND));
 
-	igt_display_fini(&data.display);
+			output = igt_get_single_output_for_pipe(&data.display,
+								pipe);
+			igt_output_set_pipe(output, pipe);
+			data.output = output;
+
+			mode = igt_output_get_mode(output);
+			w = mode->hdisplay;
+			h = mode->vdisplay;
+
+			data.pipe_crc = igt_pipe_crc_new(data.gfx_fd, pipe,
+							  INTEL_PIPE_CRC_SOURCE_AUTO);
+		}
+
+		igt_subtest_f("background-color-pipe-%s-black",
+			      kmstest_pipe_name(pipe))
+			test_background(&data, pipe, w, h,
+					0, 0, 0);
+
+		igt_subtest_f("background-color-pipe-%s-white",
+			      kmstest_pipe_name(pipe))
+			test_background(&data, pipe, w, h,
+					0xFFFF, 0xFFFF, 0xFFFF);
+
+		igt_subtest_f("background-color-pipe-%s-red",
+			      kmstest_pipe_name(pipe))
+			test_background(&data, pipe, w, h,
+					0xFFFF, 0, 0);
+
+		igt_subtest_f("background-color-pipe-%s-green",
+			      kmstest_pipe_name(pipe))
+
+			test_background(&data, pipe, w, h,
+					0, 0xFFFF, 0);
+
+		igt_subtest_f("background-color-pipe-%s-blue",
+			      kmstest_pipe_name(pipe))
+			test_background(&data, pipe, w, h,
+					0, 0, 0xFFFF);
+
+		igt_fixture {
+			igt_display_reset(&data.display);
+			igt_pipe_crc_free(data.pipe_crc);
+			data.pipe_crc = NULL;
+		}
+	}
+
+	igt_fixture {
+		igt_display_fini(&data.display);
+	}
 }
